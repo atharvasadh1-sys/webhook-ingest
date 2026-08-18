@@ -86,3 +86,48 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 		t.Fatal("expected recording_processed to be true")
 	}
 }
+
+func TestInsertEventDuplicateIsIgnored(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID:     eventID,
+		CallID:      callID,
+		AccountID:   accountID,
+		Status:      "completed",
+		DurationSec: 10,
+		Payload:     []byte(`{}`),
+	}
+
+	inserted, err := s.InsertEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("first InsertEvent: %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected first insert to succeed")
+	}
+
+	inserted, err = s.InsertEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("duplicate InsertEvent: %v", err)
+	}
+	if inserted {
+		t.Fatal("expected duplicate insert to be ignored")
+	}
+
+	var count int
+	err = s.Pool().QueryRow(
+		ctx,
+		`SELECT count(*) FROM events WHERE event_id = $1`,
+		eventID,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+
+	if count != 1 {
+		t.Fatalf("got %d events, want 1", count)
+	}
+}
