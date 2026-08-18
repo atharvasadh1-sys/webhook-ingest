@@ -26,7 +26,24 @@ type Service struct {
 
 // New builds a Service.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
-	return &Service{store: s, cache: c, rdb: rdb, log: log}
+	svc := &Service{
+		store: s,
+		cache: c,
+		rdb:   rdb,
+		log:   log,
+	}
+
+	go svc.recordingWorker(context.Background())
+
+	return svc
+}
+func (s *Service) enqueueRecording(ctx context.Context, rec store.Event) error {
+	job, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+
+	return s.rdb.RPush(ctx, "webhook:recordings", job).Err()
 }
 
 // Stats returns the cached totals for an account.
@@ -72,19 +89,48 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
-		go func() {
-			bgCtx := context.WithoutCancel(ctx)
-
-			if err := s.processRecording(bgCtx, rec); err != nil {
-				s.log.Error("recording processing failed",
-					"call_id", rec.CallID,
-					"error", err,
-				)
-			}
-		}()
+		if err := s.enqueueRecording(ctx, rec); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+func (s *Service) recordingWorker(ctx context.Context) {
+	for {
+		result, err := s.rdb.BLPop(
+			ctx,
+			0,
+			"webhook:recordings",
+		).Result()
+
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+
+			s.log.Error("recording worker failed", "error", err)
+			continue
+		}
+
+		if len(result) != 2 {
+			continue
+		}
+
+		var rec store.Event
+		if err := json.Unmarshal([]byte(result[1]), &rec); err != nil {
+			s.log.Error("invalid recording job", "error", err)
+			continue
+		}
+
+		if err := s.processRecording(ctx, rec); err != nil {
+			s.log.Error(
+				"recording processing failed",
+				"call_id", rec.CallID,
+				"error", err,
+			)
+		}
+	}
 }
 
 // processRecording downloads and transcodes the call recording, then marks
