@@ -155,8 +155,12 @@ func (s *Service) recordingWorker(ctx context.Context) {
 			ctx,
 			recordingQueueKey,
 			recordingProcessingKey,
-			0,
+			1*time.Second,
 		).Result()
+
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
 
 		if err != nil {
 			if ctx.Err() != nil {

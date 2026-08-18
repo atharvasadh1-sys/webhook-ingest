@@ -2,13 +2,20 @@ package ingest_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/convin/webhook-ingest/internal/config"
+	"github.com/convin/webhook-ingest/internal/ingest"
+	"github.com/convin/webhook-ingest/internal/redisclient"
+	"github.com/convin/webhook-ingest/internal/stats"
+	"github.com/convin/webhook-ingest/internal/store"
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -249,4 +256,106 @@ func TestRecordingIsMarkedProcessed(t *testing.T) {
 	}
 
 	t.Fatal("recording should be marked as processed")
+}
+func TestRecordingJobIsRecoveredFromProcessingList(t *testing.T) {
+	st := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	rec := store.Event{
+		EventID:      eventID,
+		CallID:       callID,
+		AccountID:    accountID,
+		Status:       "completed",
+		DurationSec:  143,
+		RecordingURL: "https://recordings.example.com/test.wav",
+		Payload:      []byte(`{}`),
+	}
+
+	if err := st.UpsertCall(ctx, rec); err != nil {
+		t.Fatalf("UpsertCall: %v", err)
+	}
+
+	job, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("marshal job: %v", err)
+	}
+
+	cfg := config.Load()
+	rdb, err := redisclient.New(ctx, cfg.RedisAddr)
+	if err != nil {
+		t.Fatalf("connect to redis: %v", err)
+	}
+	defer rdb.Close()
+
+	const (
+		processingKey = "webhook:recordings:processing"
+		queueKey      = "webhook:recordings"
+	)
+
+	if err := rdb.Del(ctx, processingKey, queueKey).Err(); err != nil {
+		t.Fatalf("clean recording queues: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = rdb.Del(
+			context.Background(),
+			processingKey,
+			queueKey,
+		).Err()
+	})
+
+	// Simulate a job left in the processing list by a worker
+	// that stopped during deployment.
+	if err := rdb.RPush(ctx, processingKey, job).Err(); err != nil {
+		t.Fatalf("seed processing job: %v", err)
+	}
+
+	// New service startup should recover the job.
+	svc := ingest.New(st, stats.NewCache(), rdb, slog.Default())
+	defer svc.Close()
+
+	deadline := time.Now().Add(1 * time.Second)
+
+	for time.Now().Before(deadline) {
+		var processed bool
+
+		row := st.Pool().QueryRow(
+			ctx,
+			`SELECT recording_processed
+			 FROM calls
+			 WHERE call_id = $1`,
+			callID,
+		)
+
+		if err := row.Scan(&processed); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+
+		if processed {
+			remaining, err := rdb.LLen(ctx, processingKey).Result()
+			if err != nil {
+				t.Fatalf("check processing list: %v", err)
+			}
+
+			if remaining != 0 {
+				t.Fatalf("processing list still contains %d jobs", remaining)
+			}
+
+			queued, err := rdb.LLen(ctx, queueKey).Result()
+			if err != nil {
+				t.Fatalf("check recording queue: %v", err)
+			}
+
+			if queued != 0 {
+				t.Fatalf("recording queue still contains %d jobs", queued)
+			}
+
+			return
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatal("recovered recording job was not processed")
 }
