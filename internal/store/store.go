@@ -205,3 +205,127 @@ func (s *Store) AccountStats(
 
 	return st, nil
 }
+
+// ProcessEvent atomically stores the event, updates the call, and increments
+// account statistics. It returns true only when the event was newly inserted.
+func (s *Store) ProcessEvent(ctx context.Context, e Event) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	var insertedID string
+
+	err = tx.QueryRow(
+		ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING
+		 RETURNING event_id`,
+		e.EventID,
+		e.CallID,
+		e.AccountID,
+		e.Payload,
+	).Scan(&insertedID)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	_, err = tx.Exec(
+		ctx,
+		`INSERT INTO calls (
+			call_id,
+			account_id,
+			status,
+			duration_sec,
+			recording_url,
+			updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, now())
+		ON CONFLICT (call_id) DO UPDATE SET
+			status        = EXCLUDED.status,
+			duration_sec  = EXCLUDED.duration_sec,
+			recording_url = EXCLUDED.recording_url,
+			updated_at    = now()`,
+		e.CallID,
+		e.AccountID,
+		e.Status,
+		e.DurationSec,
+		e.RecordingURL,
+	)
+	if err != nil {
+		return false, err
+	}
+
+	_, err = tx.Exec(
+		ctx,
+		`INSERT INTO account_stats (
+			account_id,
+			call_count,
+			total_duration_sec
+		)
+		VALUES ($1, 1, $2)
+		ON CONFLICT (account_id) DO UPDATE SET
+			call_count = account_stats.call_count + 1,
+			total_duration_sec =
+				account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID,
+		e.DurationSec,
+	)
+	if err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// AllAccountStats returns the durable account aggregates.
+func (s *Store) AllAccountStats(ctx context.Context) (map[string]Stats, error) {
+	rows, err := s.pool.Query(
+		ctx,
+		`SELECT account_id, call_count, total_duration_sec
+		 FROM account_stats`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]Stats)
+
+	for rows.Next() {
+		var accountID string
+		var st Stats
+
+		if err := rows.Scan(
+			&accountID,
+			&st.CallCount,
+			&st.TotalDurationSec,
+		); err != nil {
+			return nil, err
+		}
+
+		result[accountID] = st
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}

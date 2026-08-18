@@ -8,9 +8,10 @@ once. The root cause was that `event_id` was not enforced as a unique key at the
 database level.
 
 I fixed this by enforcing uniqueness on `events.event_id` and using
-`ON CONFLICT (event_id) DO NOTHING`. `InsertEvent` reports whether a new row was
-inserted, so duplicate deliveries skip call updates and statistics updates.
-Tests cover both repeated and concurrent duplicate deliveries.
+`ON CONFLICT (event_id) DO NOTHING`. `ProcessEvent` performs the event insert,
+call update, and account-stat update in one PostgreSQL transaction and reports
+whether the event was newly inserted. Duplicate deliveries therefore skip all
+business updates. Tests cover both repeated and concurrent duplicate deliveries.
 
 Recording processing was previously handled by an in-memory goroutine. Work
 could therefore disappear when the service restarted during deployment. I
