@@ -20,6 +20,7 @@ const (
 
 	recordingQueueKey      = "webhook:recordings"
 	recordingProcessingKey = "webhook:recordings:processing"
+	recordingOutboxPoll    = 500 * time.Millisecond
 )
 
 // Service ingests webhook deliveries.
@@ -50,6 +51,9 @@ func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *S
 
 	svc.wg.Add(1)
 	go svc.recordingWorker(workerCtx)
+
+	svc.wg.Add(1)
+	go svc.recordingOutboxWorker(workerCtx)
 
 	return svc
 }
@@ -106,12 +110,6 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	}
 
 	s.cache.Record(rec.AccountID, rec.DurationSec)
-
-	if rec.RecordingURL != "" {
-		if err := s.enqueueRecording(ctx, rec); err != nil {
-			return err
-		}
-	}
 
 	return nil
 
@@ -220,4 +218,59 @@ func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
 	}
 
 	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
+}
+
+// recordingOutboxWorker publishes durable recording jobs from Postgres to Redis.
+func (s *Service) recordingOutboxWorker(ctx context.Context) {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(recordingOutboxPoll)
+	defer ticker.Stop()
+
+	for {
+		if err := s.publishRecordingOutbox(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+
+			s.log.Error(
+				"recording outbox relay failed",
+				"error", err,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// publishRecordingOutbox publishes a small batch of pending recording jobs.
+func (s *Service) publishRecordingOutbox(ctx context.Context) error {
+	items, err := s.store.PendingRecordingOutbox(ctx, 100)
+	if err != nil {
+		return err
+	}
+
+	for _, item := range items {
+		rec := store.Event{
+			EventID:      item.EventID,
+			CallID:       item.CallID,
+			AccountID:    item.AccountID,
+			RecordingURL: item.RecordingURL,
+			Payload:      item.Payload,
+		}
+
+		if err := s.enqueueRecording(ctx, rec); err != nil {
+			return err
+		}
+
+		if err := s.store.DeleteRecordingOutbox(ctx, item.ID); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

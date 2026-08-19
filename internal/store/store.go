@@ -286,7 +286,28 @@ func (s *Store) ProcessEvent(ctx context.Context, e Event) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-
+	if e.RecordingURL != "" {
+		_, err = tx.Exec(
+			ctx,
+			`INSERT INTO recording_outbox (
+            event_id,
+            call_id,
+            account_id,
+            recording_url,
+            payload
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (event_id) DO NOTHING`,
+			e.EventID,
+			e.CallID,
+			e.AccountID,
+			e.RecordingURL,
+			e.Payload,
+		)
+		if err != nil {
+			return false, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
@@ -328,4 +349,73 @@ func (s *Store) AllAccountStats(ctx context.Context) (map[string]Stats, error) {
 	}
 
 	return result, nil
+}
+
+// RecordingOutboxItem is a pending recording job persisted in Postgres.
+type RecordingOutboxItem struct {
+	ID           int64
+	EventID      string
+	CallID       string
+	AccountID    string
+	RecordingURL string
+	Payload      []byte
+}
+
+// PendingRecordingOutbox returns pending recording jobs in creation order.
+func (s *Store) PendingRecordingOutbox(
+	ctx context.Context,
+	limit int,
+) ([]RecordingOutboxItem, error) {
+	rows, err := s.pool.Query(
+		ctx,
+		`SELECT id, event_id, call_id, account_id, recording_url, payload
+         FROM recording_outbox
+         ORDER BY id
+         LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []RecordingOutboxItem
+
+	for rows.Next() {
+		var item RecordingOutboxItem
+
+		if err := rows.Scan(
+			&item.ID,
+			&item.EventID,
+			&item.CallID,
+			&item.AccountID,
+			&item.RecordingURL,
+			&item.Payload,
+		); err != nil {
+			return nil, err
+		}
+
+		items = append(items, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return items, nil
+}
+
+// DeleteRecordingOutbox removes a job after it has been successfully
+// published to Redis.
+func (s *Store) DeleteRecordingOutbox(
+	ctx context.Context,
+	id int64,
+) error {
+	_, err := s.pool.Exec(
+		ctx,
+		`DELETE FROM recording_outbox WHERE id = $1`,
+		id,
+	)
+
+	return err
 }

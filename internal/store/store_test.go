@@ -131,3 +131,48 @@ func TestInsertEventDuplicateIsIgnored(t *testing.T) {
 		t.Fatalf("got %d events, want 1", count)
 	}
 }
+func TestProcessEventCreatesRecordingOutbox(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID:      eventID,
+		CallID:       callID,
+		AccountID:    accountID,
+		Status:       "completed",
+		DurationSec:  120,
+		RecordingURL: "https://example.com/recording.wav",
+		Payload:      []byte(`{"event_id":"test"}`),
+	}
+
+	inserted, err := s.ProcessEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("ProcessEvent: %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected event to be inserted")
+	}
+
+	var count int
+	err = s.Pool().QueryRow(
+		ctx,
+		`SELECT COUNT(*)
+		 FROM recording_outbox
+		 WHERE event_id = $1
+		   AND call_id = $2
+		   AND account_id = $3
+		   AND recording_url = $4`,
+		eventID,
+		callID,
+		accountID,
+		evt.RecordingURL,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("count recording_outbox: %v", err)
+	}
+
+	if count != 1 {
+		t.Fatalf("got %d recording_outbox rows, want 1", count)
+	}
+}
